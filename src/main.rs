@@ -45,8 +45,8 @@ fn ocr_pdf(pdf_path: &str, lang: &str) -> Result<String> {
     for (page_num, page) in document.pages().iter().enumerate() {
         // Zoom factor of 2 (roughly 144 DPI on a standard 72 DPI page).
         // For ancient/degraded Tamil text, you could push this to 3.0 if accuracy is low.
-        let zoom = 2.0;
-        let target_width = (page.width().value * zoom) as i32;
+        const ZOOM: f32 = 2.0;
+        let target_width = (page.width().value * ZOOM) as i32;
 
         let render_config = PdfRenderConfig::new().set_target_width(target_width);
 
@@ -58,15 +58,15 @@ fn ocr_pdf(pdf_path: &str, lang: &str) -> Result<String> {
 
             let width = image.width() as i32;
             let height = image.height() as i32;
-            let bytes_per_pixel = 3; // RGB is 3 bytes
-            let bytes_per_line = width * bytes_per_pixel;
+            const BYTES_PER_PIXEL: i32 = 3;
+            let bytes_per_line = width * BYTES_PER_PIXEL;
             let frame_data = image.as_raw();
             let tessdata_path = format!("{}/src/tessdata", env!("CARGO_MANIFEST_DIR"));
 
             // 5. Initialize Tesseract, load frame memory directly, and get text
             let mut tesseract = Tesseract::new(Some(&tessdata_path), Some(&lang.to_lowercase()))
                 .context("Failed to initialize Tesseract. Make sure Tesseract and 'tam' lang data are installed.")?
-                .set_frame(frame_data, width, height, bytes_per_pixel, bytes_per_line)
+                .set_frame(frame_data, width, height, BYTES_PER_PIXEL, bytes_per_line)
                 .context("Failed to set frame for Tesseract")?;
 
             let text = tesseract
