@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use pdfium_render::prelude::*;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -40,7 +41,16 @@ fn ocr_pdf(pdf_path: &str, lang: &str) -> Result<String> {
         .with_context(|| format!("Failed to open PDF file: {}", pdf_path))?;
 
     let mut full_text = String::new();
-
+    let parrallel_results: Vec<String> = document
+        .pages()
+        .iter()
+        .enumerate()
+        .par_bridge()
+        .map(|(pagenum, page)| {
+            todo!("Need to add Parallelism ");
+            pagenum.to_string()
+        })
+        .collect();
     // 3. Iterate over each page in the PDF
     for (page_num, page) in document.pages().iter().enumerate() {
         // Zoom factor of 2 (roughly 144 DPI on a standard 72 DPI page).
