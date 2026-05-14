@@ -13,7 +13,7 @@ use tesseract::Tesseract;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the PDF file to perform OCR on
-    #[arg(short, long, default_value = "test.pdf",  value_hint=clap::ValueHint::FilePath)]
+    #[arg(short, long, value_hint=clap::ValueHint::FilePath)]
     pdf_path: String,
 
     /// Language code for Tesseract (e.g., 'tam' for Tamil)
@@ -21,15 +21,13 @@ struct Args {
     lang: String,
 
     /// Output text file path
-    #[arg(short, long, default_value = "tamil_pdf_extracted_text_parallel.txt", value_hint=clap::ValueHint::FilePath)]
+    #[arg(short, long, default_value = "tamil_pdf_extracted_text.txt", value_hint=clap::ValueHint::FilePath)]
     output: String,
 
     /// Enable verbose/debug logging
     #[arg(short, long,action= clap::ArgAction::SetTrue)]
     debug: bool,
 }
-
-// ... [Args struct and main function stay the same] ...
 
 fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
     // 1. Initialize Pdfium
@@ -50,7 +48,16 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
     let pages_vec: Vec<_> = document.pages().iter().collect();
 
     // Evaluate once outside the closure
-    let tessdata_path = format!("{}/src/tessdata", env!("CARGO_MANIFEST_DIR"));
+    let tessdata_path = if std::env::var("CARGO").is_ok() {
+        // 1. If running via 'cargo run', look in your project's src folder
+        format!("{}/src/tessdata", env!("CARGO_MANIFEST_DIR"))
+    } else {
+        // 2. If running the standalone binary, look for the folder next to the EXE
+        let mut path = std::env::current_exe()?;
+        path.pop();
+        path.push("tessdata");
+        path.to_string_lossy().into_owned()
+    };
     let lower_lang = lang.to_lowercase();
 
     // MUTEXES: Protect the FFI boundaries from parallel race conditions!
