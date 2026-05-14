@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use pdfium_render::prelude::*;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -11,7 +12,7 @@ use tesseract::Tesseract;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the PDF file to perform OCR on
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "test.pdf")]
     pdf_path: String,
 
     /// Language code for Tesseract (e.g., 'tam' for Tamil)
@@ -19,7 +20,7 @@ struct Args {
     lang: String,
 
     /// Output text file path
-    #[arg(short, long, default_value = "tamil_pdf_extracted_text.txt")]
+    #[arg(short, long, default_value = "tamil_pdf_extracted_text_parallel.txt")]
     output: String,
 }
 
@@ -40,19 +41,17 @@ fn ocr_pdf(pdf_path: &str, lang: &str) -> Result<String> {
         .with_context(|| format!("Failed to open PDF file: {}", pdf_path))?;
 
     let mut full_text = String::new();
+    let pages_vec: Vec<_> = document.pages().iter().collect();
 
     // 3. Iterate over each page in the PDF
-    for (page_num, page) in document.pages().iter().enumerate() {
+    let parallel_results: Result<Vec<String>> = pages_vec.par_iter().map(|page|{
         // Zoom factor of 2 (roughly 144 DPI on a standard 72 DPI page).
         // For ancient/degraded Tamil text, you could push this to 3.0 if accuracy is low.
         const ZOOM: f32 = 2.0;
         let target_width = (page.width().value * ZOOM) as i32;
 
         let render_config = PdfRenderConfig::new().set_target_width(target_width);
-
-        // 4. Isolate page processing to neatly catch page-specific panics/errors.
-        let result = (|| -> Result<String> {
-            // Render the page to memory and convert to RGB8 image
+        // Render the page to memory and convert to RGB8 image
             let bitmap = page.render_with_config(&render_config)?;
             let image = bitmap.as_image()?.into_rgb8();
 
@@ -72,20 +71,17 @@ fn ocr_pdf(pdf_path: &str, lang: &str) -> Result<String> {
             let text = tesseract
                 .get_text()
                 .context("Failed to extract text from image")?;
-            Ok(text)
-        })();
+           Ok(text)
 
-        // 6. Output and append results
-        match result {
-            Ok(text) => {
-                println!("--- Page {} ---", page_num + 1);
-                println!("{}", text);
-                full_text.push_str(&text);
-                full_text.push('\n');
-            }
-            Err(e) => {
-                eprintln!("Error processing page {}: {:#}", page_num + 1, e);
-            }
+      }).collect();
+
+    match parallel_results {
+        Ok(txts) => {
+            full_text = txts.join("\n");
+            println!("{}", full_text);
+        }
+        Err(err) => {
+            eprintln!("Error processing page: {:#}", err);
         }
     }
 
