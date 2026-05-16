@@ -30,7 +30,7 @@ struct Args {
 }
 
 fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
-    // 1. Initialize Pdfium
+    // Initialize Pdfium
     let pdfium_bindings =
         Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
             .or_else(|_| Pdfium::bind_to_system_library())
@@ -49,10 +49,10 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
 
     // Evaluate once outside the closure
     let tessdata_path = if std::env::var("CARGO").is_ok() {
-        // 1. If running via 'cargo run', look in your project's src folder
+        // If running via 'cargo run', look in your project's src folder
         format!("{}/src/tessdata", env!("CARGO_MANIFEST_DIR"))
     } else {
-        // 2. If running the standalone binary, look for the folder next to the EXE
+        // If running the standalone binary, look for the folder next to the EXE
         let mut path = std::env::current_exe()?;
         path.pop();
         path.push("tessdata");
@@ -64,7 +64,7 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
     let render_mutex = Mutex::new(());
     let tess_init_mutex = Mutex::new(());
 
-    // 3. Iterate over each page in the PDF in parallel
+    // Iterate over each page in the PDF in parallel
     let parallel_results: Result<Vec<String>> = pages_vec.par_iter().map(|page| {
 
         let (frame_data, width, height, bytes_per_line) = {
@@ -82,7 +82,6 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
             let bytes_per_line = width * BYTES_PER_PIXEL;
             (image.into_raw(), width, height, bytes_per_line)
         };
-        // _guard is dropped here, other threads can now render safely.
 
         let tesseract = {
             let _guard = tess_init_mutex.lock().unwrap(); // Lock libc locale mutation
@@ -106,7 +105,7 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
         Ok(text)
     }).collect();
 
-    // 4. Proper error handling
+    // Proper error handling
     let txts = parallel_results?;
     let full_text = txts.join("\n");
 
