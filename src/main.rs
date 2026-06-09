@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pdfium_render::prelude::*;
 use rayon::prelude::*;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 use tesseract::Tesseract;
+
+mod ollama;
 
 /// Simple tool to extract Tamil text from PDFs via OCR.
 #[derive(Parser, Debug)]
@@ -27,9 +29,22 @@ struct Args {
     /// Enable verbose/debug logging
     #[arg(short, long,action= clap::ArgAction::SetTrue)]
     debug: bool,
+
+    #[arg(long, default_value = "http://localhost:11434", value_hint=clap::ValueHint::Url)]
+    ollama_url: String,
+
+    #[arg(long, default_value = "gemma4")]
+    ollama_model: Option<String>,
 }
 
-fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
+fn ocr_pdf(
+    pdf_path: &str,
+    lang: &str,
+    args_debug: bool,
+    ollama_model: Option<&str>,
+    ollama_url: &str,
+    output_path: &str,
+) -> Result<()> {
     // Initialize Pdfium
     let pdfium_bindings =
         Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
@@ -46,6 +61,7 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
         .with_context(|| format!("Failed to open PDF file: {}", pdf_path))?;
 
     let pages_vec: Vec<_> = document.pages().iter().collect();
+    let total_pages = pages_vec.len();
 
     // Evaluate once outside the closure
     let tessdata_path = if std::env::var("CARGO").is_ok() {
@@ -58,14 +74,40 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
         path.push("tessdata");
         path.to_string_lossy().into_owned()
     };
-    let lower_lang = lang.to_lowercase();
+    let lang = lang.to_lowercase();
 
     // MUTEXES: Protect the FFI boundaries from parallel race conditions!
     let render_mutex = Mutex::new(());
     let tess_init_mutex = Mutex::new(());
 
-    // Iterate over each page in the PDF in parallel
-    let parallel_results: Result<Vec<String>> = pages_vec.par_iter().map(|page| {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(output_path)
+        .with_context(|| format!("Failed to open output file: {}", output_path))?;
+
+    // Create a dedicated Rayon thread pool capped at 2 threads for Ollama calls
+    let ollama_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .context("Failed to build concurrent Ollama thread pool")?;
+
+    let mut previous_raw_text: Option<String> = None;
+
+    const BATCH_SIZE: usize = 10;
+
+    for chunk_start in (0..total_pages).step_by(BATCH_SIZE) {
+        let chunk_end = std::cmp::min(chunk_start + BATCH_SIZE, total_pages);
+        println!(
+            "Processing batch: pages {} to {} of {}...",
+            chunk_start + 1,
+            chunk_end,
+            total_pages
+        );
+
+        let batch_pages = &pages_vec[chunk_start..chunk_end];
+        let batch_ocr_results: Result<Vec<String>> = batch_pages.par_iter().map(|page| {
 
         let (frame_data, width, height, bytes_per_line) = {
             let _guard = render_mutex.lock().unwrap(); // Lock FFI
@@ -85,7 +127,7 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
 
         let tesseract = {
             let _guard = tess_init_mutex.lock().unwrap(); // Lock libc locale mutation
-            Tesseract::new(Some(tessdata_path.as_str()), Some(lower_lang.as_str()))
+            Tesseract::new(Some(tessdata_path.as_str()), Some(lang.as_str()))
                 .context("Failed to initialize Tesseract. Make sure Tesseract and lang data are installed.")?
         };
 
@@ -105,12 +147,78 @@ fn ocr_pdf(pdf_path: &str, lang: &str, args_debug: bool) -> Result<String> {
         Ok(text)
     }).collect();
 
-    // Proper error handling
-    let txts = parallel_results?;
-    let full_text = txts.join("\n");
+        let batch_txts = batch_ocr_results?;
 
-    Ok(full_text)
+        let final_batch_texts = if let Some(model) = ollama_model {
+            // Part B: Concurrently run Ollama (exactly 2 requests at a time)
+            if args_debug {
+                println!("Running Ollama correction on batch with a concurrency of 2...");
+            }
+
+            // Construct previous page context vectors using raw OCR text to avoid sequential blockages
+            let mut raw_contexts: Vec<Option<String>> = Vec::with_capacity(batch_txts.len());
+            for i in 0..batch_txts.len() {
+                if i == 0 {
+                    raw_contexts.push(previous_raw_text.clone());
+                } else {
+                    raw_contexts.push(Some(batch_txts[i - 1].clone()));
+                }
+            }
+
+            // Execute the Ollama requests inside the capped thread pool
+            let corrected_results: Result<Vec<String>> = ollama_pool.install(|| {
+                batch_txts
+                    .par_iter()
+                    .zip(raw_contexts.par_iter())
+                    .map(|(current_text, prev_context)| {
+                        if current_text.trim().is_empty() {
+                            return Ok(current_text.clone());
+                        }
+
+                        // Call the module function we created earlier
+                        ollama::correct_tamil_text_with_ollama(
+                            current_text,
+                            prev_context.as_deref(),
+                            model,
+                            ollama_url,
+                        )
+                    })
+                    .collect()
+            });
+
+            match corrected_results {
+                Ok(corrected_list) => {
+                    // Update our sliding raw text marker to the end of this batch
+                    previous_raw_text = batch_txts.last().cloned();
+                    corrected_list
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Batch correction failed: {}. Falling back to raw OCR text.",
+                        e
+                    );
+                    previous_raw_text = batch_txts.last().cloned();
+                    batch_txts
+                }
+            }
+        } else {
+            batch_txts
+        };
+
+        // Part C: Write corrected results to disk immediately & flush heap allocations
+        let batch_output = final_batch_texts.join("\n");
+        file.write_all(batch_output.as_bytes())
+            .context("Failed to write batch data to file")?;
+        file.write_all(b"\n")?;
+        file.flush().context("Failed to flush data to disk")?;
+
+        // At this point in the loop, temporary raw image buffers and large intermediate strings
+        // go out of scope and are cleaned up from the heap.
+    }
+
+    Ok(())
 }
+
 fn main() -> Result<()> {
     // We use clap to allow overriding defaults easily without changing the code
     let args = Args::parse();
@@ -122,13 +230,14 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let extracted_text = ocr_pdf(&args.pdf_path, &args.lang, args.debug)?;
-
-    let mut file = File::create(&args.output)
-        .with_context(|| format!("Failed to create output file: {}", args.output))?;
-
-    file.write_all(extracted_text.as_bytes())
-        .with_context(|| format!("Failed to write to output file: {}", args.output))?;
+    ocr_pdf(
+        &args.pdf_path,
+        &args.lang,
+        args.debug,
+        args.ollama_model.as_deref(),
+        &args.ollama_url,
+        &args.output,
+    )?;
 
     println!(
         "\nOCR process complete. Extracted text saved to '{}'",
