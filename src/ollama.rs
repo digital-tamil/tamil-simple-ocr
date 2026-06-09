@@ -85,7 +85,7 @@ Please analyze and correct the following OCR-extracted Tamil text based on the s
     };
 
     let response = client
-        .post(format!("{}/api/generate", url))
+        .post(format!("{url}/api/generate"))
         .json(&payload)
         .send()
         .context("Failed to connect to the Ollama server")?;
