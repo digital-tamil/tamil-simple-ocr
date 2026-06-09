@@ -14,13 +14,12 @@ struct OllamaResponse {
 }
 
 pub fn correct_tamil_text_with_ollama(
+    client: &reqwest::blocking::Client,
     current_tamil_txt: &str,
     previous_text: Option<&str>,
     model: &str,
     url: &str,
 ) -> Result<String> {
-    let client = reqwest::blocking::Client::new();
-
     let prompt = match previous_text {
         Some(tamil_prev_txt) => format!("<|turn>system
 <|think|>
@@ -79,7 +78,6 @@ Please analyze and correct the following OCR-extracted Tamil text based on the s
 </paragraph_input><turn|>
 <|turn>model"),
     };
-
     let payload = OllamaRequest {
         model: model.to_string(),
         prompt,

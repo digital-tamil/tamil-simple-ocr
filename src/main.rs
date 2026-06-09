@@ -27,7 +27,7 @@ struct Args {
     output: String,
 
     /// Enable verbose/debug logging
-    #[arg(short, long,action= clap::ArgAction::SetTrue)]
+    #[arg(short, long, action = clap::ArgAction::SetTrue)]
     debug: bool,
 
     #[arg(long, default_value = "http://localhost:11434", value_hint=clap::ValueHint::Url)]
@@ -55,7 +55,7 @@ fn ocr_pdf(
 
     let pdfium = Pdfium::new(pdfium_bindings);
 
-    // 2. Open the PDF document
+    // Open the PDF document
     let document = pdfium
         .load_pdf_from_file(pdf_path, None)
         .with_context(|| format!("Failed to open PDF file: {}", pdf_path))?;
@@ -65,10 +65,8 @@ fn ocr_pdf(
 
     // Evaluate once outside the closure
     let tessdata_path = if std::env::var("CARGO").is_ok() {
-        // If running via 'cargo run', look in your project's src folder
         format!("{}/src/tessdata", env!("CARGO_MANIFEST_DIR"))
     } else {
-        // If running the standalone binary, look for the folder next to the EXE
         let mut path = std::env::current_exe()?;
         path.pop();
         path.push("tessdata");
@@ -95,6 +93,13 @@ fn ocr_pdf(
 
     let mut previous_raw_text: Option<String> = None;
 
+    // Instantiate a single shared, thread-safe HTTP Client once.
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(None)
+        .build()
+        .context("Failed to initialize HTTP client")?;
+
     const BATCH_SIZE: usize = 10;
 
     for chunk_start in (0..total_pages).step_by(BATCH_SIZE) {
@@ -107,55 +112,59 @@ fn ocr_pdf(
         );
 
         let batch_pages = &pages_vec[chunk_start..chunk_end];
-        let batch_ocr_results: Result<Vec<String>> = batch_pages.par_iter().map(|page| {
+        let batch_ocr_results: Result<Vec<String>> = batch_pages
+            .par_iter()
+            .map(|page| {
+                let (frame_data, width, height, bytes_per_line) = {
+                    let _guard = render_mutex.lock().unwrap(); // Lock FFI
+                    const ZOOM: f32 = 2.0;
+                    let target_width = (page.width().value * ZOOM) as i32;
 
-        let (frame_data, width, height, bytes_per_line) = {
-            let _guard = render_mutex.lock().unwrap(); // Lock FFI
-            const ZOOM: f32 = 2.0;
-            let target_width = (page.width().value * ZOOM) as i32;
+                    let render_config = PdfRenderConfig::new().set_target_width(target_width);
+                    let bitmap = page
+                        .render_with_config(&render_config)
+                        .context("Failed to render page")?;
+                    let image = bitmap
+                        .as_image()
+                        .context("Failed to unwrap image")?
+                        .into_rgb8();
 
-            let render_config = PdfRenderConfig::new().set_target_width(target_width);
-            let bitmap = page.render_with_config(&render_config).context("Failed to render page")?;
-            let image = bitmap.as_image().context("Failed to unwrap image")?.into_rgb8();
+                    let width = image.width() as i32;
+                    let height = image.height() as i32;
+                    const BYTES_PER_PIXEL: i32 = 3;
+                    let bytes_per_line = width * BYTES_PER_PIXEL;
+                    (image.into_raw(), width, height, bytes_per_line)
+                };
 
-            let width = image.width() as i32;
-            let height = image.height() as i32;
-            const BYTES_PER_PIXEL: i32 = 3;
-            let bytes_per_line = width * BYTES_PER_PIXEL;
-            (image.into_raw(), width, height, bytes_per_line)
-        };
+                let tesseract = {
+                    let _guard = tess_init_mutex.lock().unwrap(); // Lock libc locale mutation
+                    Tesseract::new(Some(tessdata_path.as_str()), Some(lang.as_str()))
+                        .context("Failed to initialize Tesseract.")?
+                };
 
-        let tesseract = {
-            let _guard = tess_init_mutex.lock().unwrap(); // Lock libc locale mutation
-            Tesseract::new(Some(tessdata_path.as_str()), Some(lang.as_str()))
-                .context("Failed to initialize Tesseract. Make sure Tesseract and lang data are installed.")?
-        };
+                let mut tesseract = tesseract
+                    .set_frame(&frame_data, width, height, 3, bytes_per_line)
+                    .context("Failed to set frame for Tesseract")?;
 
-        // Setting the frame and extracting text is 100% thread-safe per instance.
-        let mut tesseract = tesseract
-            .set_frame(&frame_data, width, height, 3, bytes_per_line)
-            .context("Failed to set frame for Tesseract")?;
+                let text = tesseract
+                    .get_text()
+                    .context("Failed to extract text from image")?;
 
-        let text = tesseract
-            .get_text()
-            .context("Failed to extract text from image")?;
+                if args_debug {
+                    println!("Currently converted following content: {}", text);
+                }
 
-        if args_debug {
-            println!("Currently converted following content: {}", text);
-        }
-
-        Ok(text)
-    }).collect();
+                Ok(text)
+            })
+            .collect();
 
         let batch_txts = batch_ocr_results?;
 
         let final_batch_texts = if let Some(model) = ollama_model {
-            // Part B: Concurrently run Ollama (exactly 2 requests at a time)
             if args_debug {
                 println!("Running Ollama correction on batch with a concurrency of 2...");
             }
 
-            // Construct previous page context vectors using raw OCR text to avoid sequential blockages
             let mut raw_contexts: Vec<Option<String>> = Vec::with_capacity(batch_txts.len());
             for i in 0..batch_txts.len() {
                 if i == 0 {
@@ -165,62 +174,57 @@ fn ocr_pdf(
                 }
             }
 
-            // Execute the Ollama requests inside the capped thread pool
-            let corrected_results: Result<Vec<String>> = ollama_pool.install(|| {
+            // We collect straight into Vec<String> instead of Result<Vec<String>>
+            let corrected_list: Vec<String> = ollama_pool.install(|| {
                 batch_txts
                     .par_iter()
                     .zip(raw_contexts.par_iter())
-                    .map(|(current_text, prev_context)| {
+                    .enumerate()
+                    .map(|(offset, (current_text, prev_context))| {
+                        let absolute_page_idx = chunk_start + offset + 1;
                         if current_text.trim().is_empty() {
-                            return Ok(current_text.clone());
+                            return current_text.clone();
                         }
 
-                        // Call the module function we created earlier
-                        ollama::correct_tamil_text_with_ollama(
+                        // Local error handling ensures page failures are isolated
+                        match ollama::correct_tamil_text_with_ollama(
+                            &client, // Pass reference to the shared pool client
                             current_text,
                             prev_context.as_deref(),
                             model,
                             ollama_url,
-                        )
+                        ) {
+                            Ok(corrected) => corrected,
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Failed to correct page {} with Ollama: {}. Falling back to raw text.",
+                                    absolute_page_idx, e
+                                );
+                                current_text.clone() // Local fallback
+                            }
+                        }
                     })
                     .collect()
             });
 
-            match corrected_results {
-                Ok(corrected_list) => {
-                    // Update our sliding raw text marker to the end of this batch
-                    previous_raw_text = batch_txts.last().cloned();
-                    corrected_list
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Batch correction failed: {}. Falling back to raw OCR text.",
-                        e
-                    );
-                    previous_raw_text = batch_txts.last().cloned();
-                    batch_txts
-                }
-            }
+            previous_raw_text = batch_txts.last().cloned();
+            corrected_list
         } else {
             batch_txts
         };
 
-        // Part C: Write corrected results to disk immediately & flush heap allocations
+        // Write corrected results to disk immediately & flush heap allocations
         let batch_output = final_batch_texts.join("\n");
         file.write_all(batch_output.as_bytes())
             .context("Failed to write batch data to file")?;
         file.write_all(b"\n")?;
         file.flush().context("Failed to flush data to disk")?;
-
-        // At this point in the loop, temporary raw image buffers and large intermediate strings
-        // go out of scope and are cleaned up from the heap.
     }
 
     Ok(())
 }
 
 fn main() -> Result<()> {
-    // We use clap to allow overriding defaults easily without changing the code
     let args = Args::parse();
 
     println!("Starting OCR process...");
