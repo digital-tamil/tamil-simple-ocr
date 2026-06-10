@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use pdfium_render::prelude::*;
+use pdf_oxide::PdfDocument;
+use pdf_oxide::rendering::{RenderOptions, render_page};
 use rayon::prelude::*;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -45,23 +46,11 @@ fn ocr_pdf(
     ollama_url: &str,
     output_path: &str,
 ) -> Result<()> {
-    // Initialize Pdfium
-    let pdfium_bindings =
-        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-            .or_else(|_| Pdfium::bind_to_system_library())
-            .context(
-                "Failed to bind to Pdfium library. Please ensure the pdfium binary is available.",
-            )?;
-
-    let pdfium = Pdfium::new(pdfium_bindings);
-
-    // Open the PDF document
-    let document = pdfium
-        .load_pdf_from_file(pdf_path, None)
+    //Open the Pdf
+    let doc = PdfDocument::open(pdf_path)
         .with_context(|| format!("Failed to open PDF file: {}", pdf_path))?;
 
-    let pages_vec: Vec<_> = document.pages().iter().collect();
-    let total_pages = pages_vec.len();
+    let total_pages = doc.page_count()?;
 
     // Evaluate once outside the closure
     let tessdata_path = if std::env::var("CARGO").is_ok() {
@@ -75,7 +64,6 @@ fn ocr_pdf(
     let lang = lang.to_lowercase();
 
     // MUTEXES: Protect the FFI boundaries from parallel race conditions!
-    let render_mutex = Mutex::new(());
     let tess_init_mutex = Mutex::new(());
 
     let mut file = OpenOptions::new()
@@ -111,30 +99,27 @@ fn ocr_pdf(
             total_pages
         );
 
-        let batch_pages = &pages_vec[chunk_start..chunk_end];
-        let batch_ocr_results: Result<Vec<String>> = batch_pages
+        let page_indices: Vec<usize> = (chunk_start..chunk_end).collect();
+        let batch_ocr_results: Result<Vec<String>> = page_indices
             .par_iter()
-            .map(|page| {
-                let (frame_data, width, height, bytes_per_line) = {
-                    let _guard = render_mutex.lock().unwrap(); // Lock FFI
-                    const ZOOM: f32 = 2.0;
-                    let target_width = (page.width().value * ZOOM) as i32;
+            .map(|&page_idx| {
+                // Configure rendering options. DPI 300
+                let opts = RenderOptions::with_dpi(300);
 
-                    let render_config = PdfRenderConfig::new().set_target_width(target_width);
-                    let bitmap = page
-                        .render_with_config(&render_config)
-                        .context("Failed to render page")?;
-                    let image = bitmap
-                        .as_image()
-                        .context("Failed to unwrap image")?
-                        .into_rgb8();
+                // render_page parses and draws the PDF page in pure Rust (using tiny-skia).
+                let rendered_image = render_page(&doc, page_idx, &opts)
+                    .context("Failed to render page using pdf_oxide")?;
 
-                    let width = image.width() as i32;
-                    let height = image.height() as i32;
-                    const BYTES_PER_PIXEL: i32 = 3;
-                    let bytes_per_line = width * BYTES_PER_PIXEL;
-                    (image.into_raw(), width, height, bytes_per_line)
-                };
+                // Decode the rendered image bytes (PNG format by default) into raw RGB pixels.
+                let decoded_image = image::load_from_memory(&rendered_image.data)
+                    .context("Failed to decode rendered page bytes")?
+                    .into_rgb8();
+
+                let width = decoded_image.width() as i32;
+                let height = decoded_image.height() as i32;
+                const BYTES_PER_PIXEL: i32 = 3;
+                let bytes_per_line = width * BYTES_PER_PIXEL;
+                let frame_data = decoded_image.into_raw();
 
                 let tesseract = {
                     let _guard = tess_init_mutex.lock().unwrap(); // Lock libc locale mutation
