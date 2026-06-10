@@ -109,17 +109,33 @@ fn ocr_pdf(
                 // render_page parses and draws the PDF page in pure Rust (using tiny-skia).
                 let rendered_image = render_page(&doc, page_idx, &opts)
                     .context("Failed to render page using pdf_oxide")?;
+                let dynamic_image = image::load_from_memory(&rendered_image.data)
+                    .context("Failed to decode rendered page bytes")?;
 
-                // Decode the rendered image bytes (PNG format by default) into raw RGB pixels.
-                let decoded_image = image::load_from_memory(&rendered_image.data)
-                    .context("Failed to decode rendered page bytes")?
-                    .into_rgb8();
+                // Defensively blend over an explicit white background if an alpha channel exists.
+                let rgb_image = if dynamic_image.color().has_alpha() {
+                    // Create an RGBA canvas (fully opaque white background)
+                    let mut canvas = image::ImageBuffer::from_pixel(
+                        dynamic_image.width(),
+                        dynamic_image.height(),
+                        image::Rgba([255, 255, 255, 255]), // Red, Green, Blue, Alpha
+                    );
 
-                let width = decoded_image.width() as i32;
-                let height = decoded_image.height() as i32;
+                    // Overlay the RGBA representation onto our RGBA canvas (pixels match exactly)
+                    image::imageops::overlay(&mut canvas, &dynamic_image.to_rgba8(), 0, 0);
+
+                    // Convert the flattened RGBA canvas into an RGB8 ImageBuffer
+                    image::DynamicImage::ImageRgba8(canvas).into_rgb8()
+                } else {
+                    // Convert directly to RGB8 if no alpha transparency is present
+                    dynamic_image.into_rgb8()
+                };
+
+                let width = rgb_image.width() as i32;
+                let height = rgb_image.height() as i32;
                 const BYTES_PER_PIXEL: i32 = 3;
                 let bytes_per_line = width * BYTES_PER_PIXEL;
-                let frame_data = decoded_image.into_raw();
+                let frame_data = rgb_image.into_raw();
 
                 let tesseract = {
                     let _guard = tess_init_mutex.lock().unwrap(); // Lock libc locale mutation
